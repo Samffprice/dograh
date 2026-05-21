@@ -2,9 +2,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import LLMSettings
+from pipecat.services.xai.realtime.events import SessionUpdateEvent
 
 from api.services.pipecat.realtime.xai_realtime import DograhXAIRealtimeLLMService
 
@@ -102,6 +106,55 @@ async def test_function_call_is_deferred_until_bot_stops_speaking():
 
     service.run_function_calls.assert_awaited_once()
     assert service._deferred_function_calls == []
+
+
+def _tool(name: str) -> FunctionSchema:
+    return FunctionSchema(
+        name=name, description=f"{name} tool", properties={}, required=[]
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_transition_sends_session_update_with_new_prompt_and_tools():
+    """A node transition (prompt change + tool replacement) is delivered as a
+    single session.update carrying the fresh instructions and the new node's
+    tools — no reconnect, mirroring how the engine drives OpenAI Realtime."""
+    service = _make_service()
+    # Restore the real _process_completed_function_calls; this test exercises
+    # the session-update path, which _make_service does not stub.
+    del service._process_completed_function_calls
+    # Simulate an open, ready session.
+    sentinel_ws = object()
+    service._websocket = sentinel_ws
+    service._api_session_ready = True
+    service.send_client_event = AsyncMock()
+
+    context = LLMContext()
+    service._context = context
+
+    # --- Node A: prompt + collect_name tool ---
+    context.set_tools(ToolsSchema(standard_tools=[_tool("collect_name")]))
+    await service._update_settings(LLMSettings(system_instruction="You are at node A"))
+
+    evt_a = service.send_client_event.await_args_list[-1].args[0]
+    assert isinstance(evt_a, SessionUpdateEvent)
+    instr_a = evt_a.session.instructions
+    tools_a = {t["name"] for t in evt_a.session.tools if t.get("type") == "function"}
+    assert instr_a == "You are at node A"
+    assert tools_a == {"collect_name"}
+
+    # --- Node B: new prompt + book_appointment tool (replaces collect_name) ---
+    context.set_tools(ToolsSchema(standard_tools=[_tool("book_appointment")]))
+    await service._update_settings(LLMSettings(system_instruction="You are at node B"))
+
+    evt_b = service.send_client_event.await_args_list[-1].args[0]
+    instr_b = evt_b.session.instructions
+    tools_b = {t["name"] for t in evt_b.session.tools if t.get("type") == "function"}
+    assert instr_b == "You are at node B"
+    assert tools_b == {"book_appointment"}  # collect_name is gone (replaced)
+
+    # The WebSocket was never torn down — the update happened in-session.
+    assert service._websocket is sentinel_ws
 
 
 @pytest.mark.asyncio
