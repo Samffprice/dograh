@@ -558,6 +558,25 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
             location=location,
             settings=DograhGeminiLiveVertexLLMService.Settings(**settings_kwargs),
         )
+    elif provider == ServiceProviders.XAI_REALTIME.value:
+        from api.services.pipecat.realtime.xai_realtime import (
+            DograhXAIRealtimeLLMService,
+        )
+        from pipecat.services.xai.realtime.events import SessionProperties
+
+        # Grok fills input/output audio config from the StartFrame sample rates
+        # in its start() (_ensure_audio_config), and enables input transcription
+        # by default — no need to configure either explicitly. Turn detection
+        # defaults to server-side VAD.
+        return DograhXAIRealtimeLLMService(
+            api_key=api_key,
+            settings=DograhXAIRealtimeLLMService.Settings(
+                model=model,
+                session_properties=SessionProperties(
+                    voice=voice or "Ara",
+                ),
+            ),
+        )
     else:
         raise HTTPException(
             status_code=400, detail=f"Invalid realtime LLM provider {provider}"

@@ -35,6 +35,7 @@ class ServiceProviders(str, Enum):
     OPENAI_REALTIME = "openai_realtime"
     GOOGLE_REALTIME = "google_realtime"
     GOOGLE_VERTEX_REALTIME = "google_vertex_realtime"
+    XAI_REALTIME = "xai_realtime"
 
 
 class BaseServiceConfiguration(BaseModel):
@@ -55,6 +56,7 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.OPENAI_REALTIME,
         ServiceProviders.GOOGLE_REALTIME,
         ServiceProviders.GOOGLE_VERTEX_REALTIME,
+        ServiceProviders.XAI_REALTIME,
         # ServiceProviders.SARVAM,
     ]
     api_key: str | list[str]
@@ -477,10 +479,38 @@ class GoogleVertexRealtimeLLMConfiguration(BaseLLMConfiguration):
     )
 
 
+XAI_REALTIME_MODELS = ["grok-voice-think-fast-1.0"]
+XAI_REALTIME_VOICES = ["Ara", "Rex", "Sal", "Eve", "Leo"]
+
+
+@register_service(ServiceType.REALTIME)
+class XAIRealtimeLLMConfiguration(BaseLLMConfiguration):
+    provider: Literal[ServiceProviders.XAI_REALTIME] = (
+        ServiceProviders.XAI_REALTIME
+    )
+    model: str = Field(
+        default="grok-voice-think-fast-1.0",
+        description="xAI Grok realtime (speech-to-speech) model.",
+        json_schema_extra={
+            "examples": XAI_REALTIME_MODELS,
+            "allow_custom_input": True,
+        },
+    )
+    voice: str = Field(
+        default="Ara",
+        description="Voice the model speaks in.",
+        json_schema_extra={
+            "examples": XAI_REALTIME_VOICES,
+            "allow_custom_input": True,
+        },
+    )
+
+
 REALTIME_PROVIDERS = {
     ServiceProviders.OPENAI_REALTIME.value,
     ServiceProviders.GOOGLE_REALTIME.value,
     ServiceProviders.GOOGLE_VERTEX_REALTIME.value,
+    ServiceProviders.XAI_REALTIME.value,
 }
 
 
@@ -503,6 +533,7 @@ RealtimeConfig = Annotated[
         OpenAIRealtimeLLMConfiguration,
         GoogleRealtimeLLMConfiguration,
         GoogleVertexRealtimeLLMConfiguration,
+        XAIRealtimeLLMConfiguration,
     ],
     Field(discriminator="provider"),
 ]
