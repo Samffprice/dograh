@@ -58,6 +58,12 @@ class DograhGeminiLiveLLMService(GeminiLiveLLMService):
         # Function calls emitted by Gemini mid-bot-turn are deferred here and
         # invoked when the turn ends, so they don't race the turn's audio.
         self._pending_function_calls: list[FunctionCallFromLLM] = []
+        # tool_call_ids the server has emitted but for which we have not yet
+        # delivered a tool_response on the CURRENT session. _handle_changed_settings
+        # gates reconnects on this being empty — reconnecting before the response
+        # lands strands the call on Session A (the resumed Session B doesn't
+        # recognize the call_id and the orphan destabilizes the model).
+        self._pending_tool_responses: set[str] = set()
         # Tracks whether the next transcription to arrive should be marked as
         # the finalized transcription for the current user turn.
         self._finalize_pending: bool = False
@@ -77,9 +83,12 @@ class DograhGeminiLiveLLMService(GeminiLiveLLMService):
         if not self._session:
             # First-time setting after deferred-connect.
             await self._connect()
-        elif self._bot_is_responding:
-            # Bot is mid-turn — drain the reconnect when it ends so we don't
-            # cut the bot off mid-utterance.
+        elif self._bot_is_responding or self._pending_tool_responses:
+            # Defer reconnect: mid-utterance would cut the bot off, and
+            # mid-tool-call would strand the tool_response on a session
+            # the resumed model doesn't recognize (Gemini 3.x ignores
+            # tool_responses for call_ids issued on a different session,
+            # destabilizing the model's state).
             self._reconnect_pending = True
         else:
             await self._reconnect()
@@ -88,6 +97,11 @@ class DograhGeminiLiveLLMService(GeminiLiveLLMService):
     async def _run_or_defer_function_calls(
         self, function_calls_llm: list[FunctionCallFromLLM]
     ):
+        # Record the in-flight obligation immediately, regardless of whether
+        # dispatch happens now or after the bot turn ends. _handle_changed_settings
+        # gates reconnects on this set being empty.
+        for fc in function_calls_llm:
+            self._pending_tool_responses.add(fc.tool_call_id)
         if self._bot_is_responding:
             # Latest batch wins; Gemini emits tool calls as one batch per
             # tool_call message, so this overwrite is intentional.
@@ -108,7 +122,13 @@ class DograhGeminiLiveLLMService(GeminiLiveLLMService):
         await super()._set_bot_is_responding(responding)
         if was_responding and not responding:
             await self._run_pending_function_calls()
-            if self._reconnect_pending:
+            # Only fire the deferred reconnect when no tool_response is
+            # still owed on this session. Otherwise the reconnect would
+            # close Session A before the response is delivered, stranding
+            # the call_id on the resumed session that doesn't recognize it.
+            # The fired-from-_tool_result alternative is unsafe: it would
+            # close the session before the model's post-tool turn arrives.
+            if self._reconnect_pending and not self._pending_tool_responses:
                 self._reconnect_pending = False
                 await self._reconnect()
 
@@ -123,6 +143,19 @@ class DograhGeminiLiveLLMService(GeminiLiveLLMService):
             "after bot turn ended"
         )
         await self.run_function_calls(fcs)
+
+    async def _tool_result(self, tool_call_id, tool_name, tool_result_message):
+        # On successful send we discard from _pending_tool_responses so the
+        # next _set_bot_is_responding(False) can fire the deferred reconnect.
+        # On queued/failed send (returns False), the upstream queue
+        # (_pending_tool_results) holds the response for drain — but
+        # because _handle_changed_settings defers reconnects while
+        # _pending_tool_responses is non-empty, the queued path is
+        # effectively unreachable for engine-driven reconnects with this fix.
+        delivered = await super()._tool_result(tool_call_id, tool_name, tool_result_message)
+        if delivered:
+            self._pending_tool_responses.discard(tool_call_id)
+        return delivered
 
     # ------------------------------------------------------------------
     # Frame handling: mute, TTSSpeakFrame, BotStoppedSpeakingFrame flush
