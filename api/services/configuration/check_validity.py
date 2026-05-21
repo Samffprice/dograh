@@ -50,6 +50,7 @@ class UserConfigurationValidator:
             ServiceProviders.OPENAI_REALTIME.value: self._check_openai_api_key,
             ServiceProviders.GOOGLE_REALTIME.value: self._check_google_api_key,
             ServiceProviders.GOOGLE_VERTEX_REALTIME.value: self._check_google_vertex_realtime_api_key,
+            ServiceProviders.XAI_REALTIME.value: self._check_xai_realtime_api_key,
             ServiceProviders.ASSEMBLYAI.value: self._check_assemblyai_api_key,
             ServiceProviders.GLADIA.value: self._check_gladia_api_key,
             ServiceProviders.RIME.value: self._check_rime_api_key,
@@ -196,6 +197,23 @@ class UserConfigurationValidator:
 
     def _check_google_api_key(self, model: str, api_key: str) -> bool:
         return True
+
+    def _check_xai_realtime_api_key(self, model: str, api_key: str) -> bool:
+        # xAI exposes an OpenAI-compatible REST API, so validate the key by
+        # listing models. Unlike OpenAI (401 AuthenticationError), xAI signals
+        # an incorrect key with a 400 BadRequestError ("Incorrect API key
+        # provided"); models.list() takes no client args, so a 4xx here means
+        # the key is unusable. Treat all of those as invalid.
+        client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+        try:
+            client.models.list()
+            return True
+        except (
+            openai.AuthenticationError,
+            openai.PermissionDeniedError,
+            openai.BadRequestError,
+        ):
+            return False
 
     def _check_azure_api_key(self, model: str, api_key: str) -> bool:
         return True
