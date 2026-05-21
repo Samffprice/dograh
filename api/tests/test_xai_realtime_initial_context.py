@@ -69,7 +69,11 @@ async def test_tts_greeting_uses_initial_context_handler():
 
 
 @pytest.mark.asyncio
-async def test_function_call_executes_immediately_when_bot_is_not_speaking():
+async def test_function_call_runs_immediately_without_deferral():
+    # Tool calls must run as soon as the arguments arrive — we deliberately do
+    # NOT defer until the bot stops speaking, because that stalls on Grok (the
+    # model says "let me check" and the call never fires). Guard against the
+    # defer machinery being re-introduced.
     service = _make_service()
     service._context = LLMContext()
     service.run_function_calls = AsyncMock()
@@ -82,30 +86,8 @@ async def test_function_call_executes_immediately_when_bot_is_not_speaking():
     )
 
     service.run_function_calls.assert_awaited_once()
-    assert service._deferred_function_calls == []
-
-
-@pytest.mark.asyncio
-async def test_function_call_is_deferred_until_bot_stops_speaking():
-    service = _make_service()
-    service._context = LLMContext()
-    service.run_function_calls = AsyncMock()
-    service._bot_is_speaking = True
-    service._pending_function_calls["call-1"] = SimpleNamespace(name="customer_support")
-
-    await service._handle_evt_function_call_arguments_done(
-        SimpleNamespace(
-            call_id="call-1", name="customer_support", arguments='{"department":"sales"}'
-        )
-    )
-
-    service.run_function_calls.assert_not_awaited()
-    assert len(service._deferred_function_calls) == 1
-
-    await service._run_pending_function_calls()
-
-    service.run_function_calls.assert_awaited_once()
-    assert service._deferred_function_calls == []
+    assert not hasattr(service, "_deferred_function_calls")
+    assert not hasattr(service, "_bot_is_speaking")
 
 
 def _tool(name: str) -> FunctionSchema:

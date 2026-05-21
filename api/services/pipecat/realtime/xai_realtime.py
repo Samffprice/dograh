@@ -19,10 +19,15 @@ Adds:
   means ``self._context`` is None" trigger no longer fires. We gate on
   ``_handled_initial_context`` and let the engine's greeting ``TTSSpeakFrame``
   drive the initial response instead.
-- **Function-call deferral.** Tool calls emitted mid-bot-turn are queued and run
-  when the bot stops speaking, so they don't race the turn's audio.
 - **User-mute audio gating.** ``UserMuteStarted/StoppedFrame`` gate whether
   incoming audio is forwarded to Grok.
+
+Function calls run immediately (upstream behavior). We deliberately do NOT
+defer them until the bot stops speaking: with the engine's "say a filler, then
+call the tool" prompts the bot is always speaking when the call arrives, and
+Grok does not reliably emit a ``BotStoppedSpeakingFrame`` around a
+response-with-tool-call, so a defer-until-bot-stops queue stalls — the model
+says "let me check" and the tool never fires.
 - **LLMMessagesAppendFrame handling** for one-off ephemeral prompts (e.g.
   user-idle checks); upstream Grok leaves this unimplemented.
 - **Transcription broadcast** with ``finalized=True`` so the downstream
@@ -31,14 +36,11 @@ Adds:
   construction), for parity with the OpenAI service.
 """
 
-import json
 from typing import Any
 
 from loguru import logger
 
 from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
     Frame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
@@ -48,7 +50,6 @@ from pipecat.frames.frames import (
     UserMuteStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.llm_service import FunctionCallFromLLM
 from pipecat.services.xai.realtime import events
 from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
 from pipecat.transcriptions.language import Language
@@ -68,10 +69,6 @@ class DograhXAIRealtimeLLMService(GrokRealtimeLLMService):
         # LLMContextFrame arrives, so upstream's "first arrival means
         # self._context is None" check no longer works. Gate on this instead.
         self._handled_initial_context: bool = False
-        # Track bot speech locally so tool calls can be deferred until the bot
-        # has finished speaking, matching the Dograh OpenAI/Gemini behavior.
-        self._bot_is_speaking: bool = False
-        self._deferred_function_calls: list[FunctionCallFromLLM] = []
 
     # ------------------------------------------------------------------
     # Deferred connect: hold the WebSocket until system_instruction is set.
@@ -127,11 +124,6 @@ class DograhXAIRealtimeLLMService(GrokRealtimeLLMService):
                     "handled — Grok Realtime owns audio generation, ignoring"
                 )
             return
-        if isinstance(frame, BotStartedSpeakingFrame):
-            self._bot_is_speaking = True
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            self._bot_is_speaking = False
-            await self._run_pending_function_calls()
         await super().process_frame(frame, direction)
 
     async def _send_user_audio(self, frame):
@@ -157,54 +149,6 @@ class DograhXAIRealtimeLLMService(GrokRealtimeLLMService):
         else:
             self._context = context
             await self._process_completed_function_calls(send_new_results=True)
-
-    # ------------------------------------------------------------------
-    # Function-call deferral: queue tool calls emitted mid-bot-turn and run
-    # them when the bot stops speaking, so they don't race the turn's audio.
-    # ------------------------------------------------------------------
-
-    async def _handle_evt_function_call_arguments_done(self, evt):
-        try:
-            args = json.loads(evt.arguments)
-
-            function_call_item = self._pending_function_calls.get(evt.call_id)
-            if not function_call_item:
-                logger.warning(
-                    f"No tracked function call found for call_id: {evt.call_id}"
-                )
-                return
-            del self._pending_function_calls[evt.call_id]
-
-            function_calls = [
-                FunctionCallFromLLM(
-                    context=self._context,
-                    tool_call_id=evt.call_id,
-                    function_name=evt.name,
-                    arguments=args,
-                )
-            ]
-
-            if self._bot_is_speaking:
-                self._deferred_function_calls.extend(function_calls)
-                logger.debug(
-                    f"{self}: deferring function call {evt.name} until bot stops speaking"
-                )
-            else:
-                await self.run_function_calls(function_calls)
-                logger.debug(f"Processed function call: {evt.name}")
-        except Exception as e:
-            logger.error(f"Failed to process function call arguments: {e}")
-
-    async def _run_pending_function_calls(self):
-        if not self._deferred_function_calls:
-            return
-        function_calls = self._deferred_function_calls
-        self._deferred_function_calls = []
-        logger.debug(
-            f"{self}: executing {len(function_calls)} deferred function call(s) "
-            "after bot turn ended"
-        )
-        await self.run_function_calls(function_calls)
 
     # ------------------------------------------------------------------
     # One-off ephemeral prompts (user-idle checks, etc.). Upstream Grok leaves
